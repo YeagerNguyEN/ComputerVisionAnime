@@ -1,0 +1,509 @@
+/* =====================================================================
+   MAGIC QUAD — script.js
+   -----------------------------------------------------------------
+   1. Camera & MediaPipe Hands setup (client-side, không gửi frame lên server)
+   2. Trích 4 điểm: thumb_tip (4) + index_tip (8) của mỗi bàn tay
+   3. Ghép 4 điểm thành tứ giác động (Magic Quad) khi đủ điều kiện
+   4. Bên trong tứ giác: lọc Anime/Manga (posterize + Sobel edge overlay)
+   5. HUD: trạng thái, loading bar, nút xoay camera
+===================================================================== */
+
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------
+  // DOM refs
+  // ---------------------------------------------------------------
+  const video       = document.getElementById('video');
+  const canvas      = document.getElementById('stage');
+  const ctx         = canvas.getContext('2d', { willReadFrequently: true });
+  const loader      = document.getElementById('loader');
+  const loaderFill  = document.getElementById('loaderFill');
+  const loaderPct   = document.getElementById('loaderPct');
+  const statusEl    = document.getElementById('status');
+  const statusDot   = document.getElementById('statusDot');
+  const statusText  = document.getElementById('statusText');
+  const hintEl      = document.getElementById('hint');
+  const switchBtn   = document.getElementById('switchCam');
+  const errorBox    = document.getElementById('errorBox');
+  const errorMsg    = document.getElementById('errorMsg');
+
+  // ---------------------------------------------------------------
+  // Cấu hình (tinh chỉnh hiệu năng / cảm giác gesture ở đây)
+  // ---------------------------------------------------------------
+  const CONFIG = {
+    maxNumHands: 2,
+    modelComplexity: 0,          // 0 = lite, nhanh hơn trên mobile
+    minDetectionConfidence: 0.65,
+    minTrackingConfidence: 0.55,
+
+    // Ngưỡng diện tích tứ giác để kích hoạt "cửa sổ thần kỳ"
+    // (tránh trường hợp 2 tay quá gần -> tứ giác suy biến,
+    //  hoặc 2 tay quá xa -> tràn hết màn hình)
+    minQuadAreaPx: 5000,
+    maxQuadAreaRatio: 0.62,      // tỉ lệ so với diện tích canvas
+
+    smoothingFactor: 0.4,        // EMA cho điểm góc, giảm rung
+    filterDownscale: 0.55,       // giảm độ phân giải vùng lọc để tăng FPS
+    posterizeLevels: 6,
+    edgeThreshold: 58,
+
+    landmarkThumb: 4,
+    landmarkIndex: 8,
+  };
+
+  // ---------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------
+  let hands = null;
+  let currentFacing = 'user';
+  let stream = null;
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let smoothedPoints = null;     // 4 điểm đã làm mượt [{x,y}...]
+  let quadActive = false;
+  let lastResults = null;
+  let running = false;
+
+  let fpsFrames = 0, fpsLast = performance.now(), fpsValue = 0;
+
+  // offscreen canvas dùng để dựng ảnh đã lọc anime rồi ghép (clip) vào canvas chính
+  const offCanvas = document.createElement('canvas');
+  const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+
+  // ---------------------------------------------------------------
+  // Loading bar giả lập (MediaPipe không expose % tải model theo byte)
+  // ---------------------------------------------------------------
+  let fakeProgress = 0;
+  let progressTimer = setInterval(() => {
+    fakeProgress = Math.min(fakeProgress + (Math.random() * 6 + 2), 90);
+    setLoaderProgress(fakeProgress);
+  }, 220);
+
+  function setLoaderProgress(pct) {
+    loaderFill.style.width = pct.toFixed(0) + '%';
+    loaderPct.textContent = pct.toFixed(0) + '%';
+  }
+
+  function finishLoading() {
+    clearInterval(progressTimer);
+    setLoaderProgress(100);
+    setTimeout(() => loader.classList.add('is-hidden'), 320);
+  }
+
+  function showError(msg) {
+    clearInterval(progressTimer);
+    loader.classList.add('is-hidden');
+    errorBox.hidden = false;
+    errorMsg.textContent = msg;
+  }
+
+  function setStatus(mode, text) {
+    statusEl.classList.remove('is-live', 'is-active');
+    if (mode) statusEl.classList.add(mode);
+    statusText.textContent = text;
+  }
+
+  // ---------------------------------------------------------------
+  // 1) Khởi tạo MediaPipe Hands
+  // ---------------------------------------------------------------
+  function createHands() {
+    hands = new Hands({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+    });
+    hands.setOptions({
+      maxNumHands: CONFIG.maxNumHands,
+      modelComplexity: CONFIG.modelComplexity,
+      minDetectionConfidence: CONFIG.minDetectionConfidence,
+      minTrackingConfidence: CONFIG.minTrackingConfidence,
+      selfieMode: false, // ta tự xử lý mirror lúc vẽ, giữ toạ độ gốc nhất quán
+    });
+    hands.onResults(onResults);
+    // initialize() trả Promise khi model + wasm đã tải xong (nếu API hỗ trợ)
+    if (typeof hands.initialize === 'function') {
+      return hands.initialize();
+    }
+    return Promise.resolve();
+  }
+
+  // ---------------------------------------------------------------
+  // 2) Camera
+  // ---------------------------------------------------------------
+  async function startCamera(facing) {
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      stream = null;
+    }
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: facing },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    currentFacing = facing;
+
+    await new Promise((resolve) => {
+      if (video.readyState >= 2) return resolve();
+      video.onloadedmetadata = () => resolve();
+    });
+    await video.play();
+    resizeCanvas();
+  }
+
+  switchBtn.addEventListener('click', async () => {
+    switchBtn.disabled = true;
+    const next = currentFacing === 'user' ? 'environment' : 'user';
+    try {
+      await startCamera(next);
+    } catch (err) {
+      // Một số thiết bị/desktop chỉ có 1 camera — báo nhẹ, không chặn app
+      try { await startCamera(currentFacing); } catch (_) { /* ignore */ }
+      console.warn('Không thể xoay camera:', err);
+    } finally {
+      switchBtn.disabled = false;
+    }
+  });
+
+  // ---------------------------------------------------------------
+  // 3) Canvas sizing (theo devicePixelRatio, full-bleed)
+  // ---------------------------------------------------------------
+  function resizeCanvas() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  window.addEventListener('resize', resizeCanvas);
+  window.addEventListener('orientationchange', resizeCanvas);
+
+  // ---------------------------------------------------------------
+  // 4) Vòng lặp gửi frame cho MediaPipe
+  // ---------------------------------------------------------------
+  async function frameLoop() {
+    if (running && video.readyState >= 2) {
+      await hands.send({ image: video });
+    }
+    requestAnimationFrame(frameLoop);
+  }
+
+  // ---------------------------------------------------------------
+  // 5) Toạ độ: video-space (normalized) -> canvas-space (đã mirror nếu cần)
+  // ---------------------------------------------------------------
+  function mapLandmarkToCanvas(lm) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const cw = canvas.width, ch = canvas.height;
+    const scale = Math.max(cw / vw, ch / vh);
+    const svw = vw * scale, svh = vh * scale;
+    const ox = (cw - svw) / 2, oy = (ch - svh) / 2;
+
+    const px = lm.x * vw * scale + ox;
+    const py = lm.y * vh * scale + oy;
+
+    const mirror = currentFacing === 'user';
+    return { x: mirror ? cw - px : px, y: py };
+  }
+
+  function drawBackground() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    const cw = canvas.width, ch = canvas.height;
+    const scale = Math.max(cw / vw, ch / vh);
+    const svw = vw * scale, svh = vh * scale;
+    const ox = (cw - svw) / 2, oy = (ch - svh) / 2;
+
+    ctx.save();
+    // lọc nhẹ cho đẹp hơn: tăng tương phản / bão hoà một chút
+    ctx.filter = 'contrast(1.06) saturate(1.15) brightness(1.02)';
+    if (currentFacing === 'user') {
+      ctx.translate(cw, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(video, ox, oy, svw, svh);
+    ctx.restore();
+    ctx.filter = 'none';
+  }
+
+  // ---------------------------------------------------------------
+  // 6) Hình học tứ giác ma thuật
+  // ---------------------------------------------------------------
+  function orderQuadPoints(pts) {
+    // sắp xếp 4 điểm quanh trọng tâm theo góc -> đa giác không tự cắt
+    const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+    const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+    return [...pts].sort(
+      (a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
+    );
+  }
+
+  function polygonArea(pts) {
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const p1 = pts[i], p2 = pts[(i + 1) % pts.length];
+      a += p1.x * p2.y - p2.x * p1.y;
+    }
+    return Math.abs(a) / 2;
+  }
+
+  function updateQuad(results) {
+    const handsLm = results.multiHandLandmarks || [];
+
+    if (handsLm.length !== 2) {
+      quadActive = false;
+      smoothedPoints = null;
+      return null;
+    }
+
+    const raw = [
+      mapLandmarkToCanvas(handsLm[0][CONFIG.landmarkThumb]),
+      mapLandmarkToCanvas(handsLm[0][CONFIG.landmarkIndex]),
+      mapLandmarkToCanvas(handsLm[1][CONFIG.landmarkThumb]),
+      mapLandmarkToCanvas(handsLm[1][CONFIG.landmarkIndex]),
+    ];
+    const ordered = orderQuadPoints(raw);
+    const area = polygonArea(ordered);
+    const canvasArea = canvas.width * canvas.height;
+
+    const withinRange =
+      area > CONFIG.minQuadAreaPx * dpr * dpr &&
+      area < CONFIG.maxQuadAreaRatio * canvasArea;
+
+    if (!withinRange) {
+      quadActive = false;
+      smoothedPoints = null;
+      return null;
+    }
+
+    quadActive = true;
+
+    if (!smoothedPoints) {
+      smoothedPoints = ordered.map((p) => ({ ...p }));
+    } else {
+      const k = CONFIG.smoothingFactor;
+      smoothedPoints = smoothedPoints.map((sp, i) => ({
+        x: sp.x + (ordered[i].x - sp.x) * k,
+        y: sp.y + (ordered[i].y - sp.y) * k,
+      }));
+    }
+    return smoothedPoints;
+  }
+
+  // ---------------------------------------------------------------
+  // 7) Bộ lọc Anime/Manga: posterize (cel-shading) + Sobel edge overlay
+  // ---------------------------------------------------------------
+  function animeFilterInPlace(imgData) {
+    const { data, width, height } = imgData;
+    const n = width * height;
+    const gray = new Uint8ClampedArray(n);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      gray[p] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+    }
+
+    // Color Quantization (posterize) -> mảng màu phẳng kiểu cel-shading
+    const levels = CONFIG.posterizeLevels;
+    const step = 255 / (levels - 1);
+    for (let i = 0; i < data.length; i += 4) {
+      data[i]     = Math.round(Math.round(data[i]     / step) * step);
+      data[i + 1] = Math.round(Math.round(data[i + 1] / step) * step);
+      data[i + 2] = Math.round(Math.round(data[i + 2] / step) * step);
+      // đẩy nhẹ bão hoà để giống anime hơn
+      const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      data[i]     = clamp255(avg + (data[i]     - avg) * 1.25);
+      data[i + 1] = clamp255(avg + (data[i + 1] - avg) * 1.25);
+      data[i + 2] = clamp255(avg + (data[i + 2] - avg) * 1.25);
+    }
+
+    // Edge Detection (Sobel) -> viền đen kiểu nét vẽ manga
+    const th = CONFIG.edgeThreshold;
+    for (let y = 1; y < height - 1; y++) {
+      const rowUp = (y - 1) * width, row = y * width, rowDown = (y + 1) * width;
+      for (let x = 1; x < width - 1; x++) {
+        const tl = gray[rowUp + x - 1],   tc = gray[rowUp + x],   tr = gray[rowUp + x + 1];
+        const ml = gray[row + x - 1],                              mr = gray[row + x + 1];
+        const bl = gray[rowDown + x - 1], bc = gray[rowDown + x], br = gray[rowDown + x + 1];
+
+        const gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+        const gy = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+        const mag = Math.sqrt(gx * gx + gy * gy);
+
+        if (mag > th) {
+          const idx = (row + x) * 4;
+          data[idx] = data[idx + 1] = data[idx + 2] = 22;
+        }
+      }
+    }
+  }
+
+  function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
+
+  // Áp filter lên vùng bbox của tứ giác (đọc trực tiếp từ canvas chính,
+  // xử lý ở độ phân giải giảm để giữ FPS, rồi vẽ ngược lại có clip theo tứ giác)
+  function renderAnimeWindow(points) {
+    const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+    const pad = 6 * dpr;
+    let bx = Math.max(0, Math.min(...xs) - pad);
+    let by = Math.max(0, Math.min(...ys) - pad);
+    let bx2 = Math.min(canvas.width, Math.max(...xs) + pad);
+    let by2 = Math.min(canvas.height, Math.max(...ys) + pad);
+    const bw = Math.max(2, bx2 - bx);
+    const bh = Math.max(2, by2 - by);
+    if (bw < 4 || bh < 4) return;
+
+    const scale = CONFIG.filterDownscale;
+    const sw = Math.max(2, Math.round(bw * scale));
+    const sh = Math.max(2, Math.round(bh * scale));
+
+    offCanvas.width = sw;
+    offCanvas.height = sh;
+    offCtx.imageSmoothingEnabled = true;
+    // lấy đúng vùng ảnh (đã có video nền) từ canvas chính, thu nhỏ để xử lý nhanh
+    offCtx.drawImage(canvas, bx, by, bw, bh, 0, 0, sw, sh);
+
+    const imgData = offCtx.getImageData(0, 0, sw, sh);
+    animeFilterInPlace(imgData);
+    offCtx.putImageData(imgData, 0, 0);
+
+    // ghép ảnh đã lọc trở lại canvas chính, chỉ hiển thị bên trong tứ giác (clip)
+    ctx.save();
+    ctx.beginPath();
+    points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.closePath();
+    ctx.clip();
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offCanvas, bx, by, bw, bh);
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------
+  // 8) Vẽ khung viền phát sáng + reticle tại 4 đầu ngón tay
+  // ---------------------------------------------------------------
+  let dashPhase = 0;
+  function drawQuadFrame(points) {
+    dashPhase = (dashPhase + 1.4) % 1000;
+
+    ctx.save();
+    ctx.beginPath();
+    points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.closePath();
+
+    const grad = ctx.createLinearGradient(points[0].x, points[0].y, points[2].x, points[2].y);
+    grad.addColorStop(0, '#34f5ff');
+    grad.addColorStop(1, '#ff3fd8');
+
+    ctx.lineWidth = 2.4 * dpr;
+    ctx.strokeStyle = grad;
+    ctx.shadowColor = 'rgba(52,245,255,0.85)';
+    ctx.shadowBlur = 16 * dpr;
+    ctx.setLineDash([10 * dpr, 6 * dpr]);
+    ctx.lineDashOffset = -dashPhase * dpr * 0.6;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // reticle ở mỗi đầu ngón tay
+    points.forEach((p) => {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(234,246,248,0.9)';
+      ctx.lineWidth = 1.4 * dpr;
+      ctx.shadowColor = '#34f5ff';
+      ctx.shadowBlur = 8 * dpr;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 7 * dpr, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2 * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff3fd8';
+      ctx.shadowBlur = 6 * dpr;
+      ctx.fill();
+      ctx.restore();
+    });
+  }
+
+  // reticle mờ khi chưa đủ điều kiện kích hoạt (phản hồi trực quan nhẹ nhàng)
+  function drawIdleFingertips(results) {
+    const handsLm = results.multiHandLandmarks || [];
+    if (!handsLm.length) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(52,245,255,0.55)';
+    handsLm.forEach((lm) => {
+      [CONFIG.landmarkThumb, CONFIG.landmarkIndex].forEach((idx) => {
+        const p = mapLandmarkToCanvas(lm[idx]);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4 * dpr, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    });
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------
+  // 9) onResults — trung tâm render mỗi khung hình
+  // ---------------------------------------------------------------
+  function onResults(results) {
+    lastResults = results;
+
+    if (!running) {
+      running = true;
+      finishLoading();
+    }
+
+    drawBackground();
+
+    const quadPoints = updateQuad(results);
+    if (quadPoints) {
+      renderAnimeWindow(quadPoints);
+      drawQuadFrame(quadPoints);
+      setStatus('is-active', `Cửa sổ Anime đang mở${fpsValue ? ' · ' + fpsValue + ' FPS' : ''}`);
+      hintEl.textContent = 'Di chuyển hai tay để điều khiển cửa sổ anime';
+      hintEl.classList.add('is-active');
+    } else {
+      drawIdleFingertips(results);
+      const nHands = (results.multiHandLandmarks || []).length;
+      setStatus('is-live', `Đang theo dõi tay (${nHands}/2)${fpsValue ? ' · ' + fpsValue + ' FPS' : ''}`);
+      hintEl.textContent = 'Đưa hai bàn tay vào khung hình và chụm ngón cái · ngón trỏ để mở cửa sổ anime';
+      hintEl.classList.remove('is-active');
+    }
+
+    // FPS
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLast >= 1000) {
+      fpsValue = fpsFrames;
+      fpsFrames = 0;
+      fpsLast = now;
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 10) Khởi động ứng dụng
+  // ---------------------------------------------------------------
+  async function boot() {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Trình duyệt không hỗ trợ truy cập camera (WebRTC).');
+      }
+      resizeCanvas();
+      await createHands();
+      await startCamera('user');
+      requestAnimationFrame(frameLoop);
+    } catch (err) {
+      console.error(err);
+      let msg = 'Không thể truy cập camera hoặc tải mô hình AI. ';
+      if (err && err.name === 'NotAllowedError') {
+        msg += 'Vui lòng cấp quyền camera cho trang này rồi tải lại.';
+      } else if (err && err.name === 'NotFoundError') {
+        msg += 'Không tìm thấy camera trên thiết bị.';
+      } else {
+        msg += 'Vui lòng chạy qua HTTPS hoặc localhost và thử lại. (' + (err.message || err) + ')';
+      }
+      showError(msg);
+    }
+  }
+
+  boot();
+})();
