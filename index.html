@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Cyber-Quad: Anime Vision</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- MediaPipe Hands & Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div id="app-container">
+        <!-- Nguồn video ẩn -->
+        <video id="input_video" playsinline></video>
+        
+        <!-- Canvas hiển thị chính -->
+        <canvas id="output_canvas"></canvas>
+
+        <!-- UI Layer -->
+        <div id="ui-layer">
+            <div id="loading-screen">
+                <div class="spinner"></div>
+                <p>INITIALIZING NEURAL NETWORK...</p>
+            </div>
+            
+            <button id="switch-cam-btn">
+                <span class="btn-text">⟲ SWITCH CAM</span>
+            </button>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
